@@ -2,7 +2,7 @@
 // @name              yyawf
 // @description       Under construction
 // @namespace         https://github.com/tiansh
-// @version           0.0.11
+// @version           0.0.15
 // @match             *://*.weibo.com/*
 // @noframes
 // @run-at            document-start
@@ -37,9 +37,14 @@ const payload = (Array(35).fill('\n').join('') + 'void(' + function (config, mes
 
   const $CONFIG = {}, yawfConfig = {};
   let isDebug = null;
-  if (typeof window.$CONFIG !== 'undefined') {
-    alert('脚本需要在页面打开前加载才能正常工作。当前注入加载时间过晚，请检查你是用的猴子版本是否受到支持。');
-  }
+  // Preserve the URL seen at document-start.  Web Weibo can temporarily report
+  // its home route while it opens a post detail, so checking it later is unsafe.
+  const startedAtHome = location.pathname === '/' || location.pathname === '/home';
+  // Some script managers inject a `document-start` userscript after Web Weibo
+  // has mounted its Vue application.  Do not interrupt navigation in that case:
+  // the initialization code below can discover the already-mounted app.
+  const injectedLate = typeof window.$CONFIG !== 'undefined';
+  if (injectedLate) console.warn('[yyawf] injected after Web Weibo was initialized; recovering from the mounted app.');
 
   //#region utils
   const log = function (...args) {
@@ -214,12 +219,19 @@ const payload = (Array(35).fill('\n').join('') + 'void(' + function (config, mes
   //#region 初始化
   /** @type {Promise<App>} */
   const appReady = new Promise(resolve => {
+    let resolved = false;
+    const finish = app => {
+      if (resolved || !app?.config?.globalProperties) return false;
+      resolved = true;
+      resolve(app);
+      return true;
+    };
     const prevDesc = Object.getOwnPropertyDescriptor(Object.prototype, '$cookies');
     const isVueApp = obj => obj?._uid === 0;
     Object.defineProperty(Object.prototype, '$cookies', {
       set(value) {
         if (isVueApp(this)) {
-          resolve(this);
+          finish(this);
           delete Object.prototype.$cookies;
           if (prevDesc && typeof prevDesc.set === 'function') {
             Object.defineProperty(Object.prototype, '$cookies', prevDesc);
@@ -233,6 +245,43 @@ const payload = (Array(35).fill('\n').join('') + 'void(' + function (config, mes
       configurable: true,
       enumerable: false,
     });
+
+    // Vue 3 stores the app on its mount container.  On pages where the normal
+    // $cookies hook has already run, recover it from the DOM instead.
+    const findMountedApp = () => {
+      const inspect = node => {
+        if (!node) return null;
+        if (node.__vue_app__?.config?.globalProperties) return node.__vue_app__;
+        const component = node.__vueParentComponent;
+        return component?.appContext?.app?.config?.globalProperties ? component.appContext.app : null;
+      };
+      for (const node of [document.querySelector('#app'), document.body, document.documentElement]) {
+        const app = inspect(node);
+        if (app) return app;
+      }
+      for (const node of document.querySelectorAll('*')) {
+        const app = inspect(node);
+        if (app) return app;
+      }
+      return null;
+    };
+    const recover = () => {
+      const app = findMountedApp();
+      if (finish(app)) {
+        observer.disconnect();
+        clearInterval(timer);
+      }
+    };
+    const observer = new MutationObserver(recover);
+    const startRecovery = () => {
+      recover();
+      if (!resolved) {
+        observer.observe(document.documentElement, { childList: true, subtree: true });
+        timer = setInterval(recover, 100);
+      }
+    };
+    let timer = null;
+    if (injectedLate) startRecovery();
   });
   //#endregion
 
@@ -357,6 +406,87 @@ const payload = (Array(35).fill('\n').join('') + 'void(' + function (config, mes
     Object.assign(yawfConfig, config[$CONFIG.user.idstr]);
     isDebug = yawfConfig['about::debug'];
   });
+
+  //#region 首页路由修正
+  appReady.then(app => {
+    const router = app.config.globalProperties.$router;
+    if (!router) return;
+    const uid = $CONFIG.user.idstr;
+    const gid = '11000' + uid;
+    const targetPath = '/mygroups?gid=' + gid;
+
+    const isEnabled = () => getConfigBoolean('home::newest');
+
+    const isAtTarget = () => {
+      try {
+        const url = new URL(location.href);
+        return url.pathname === '/mygroups' && url.searchParams.get('gid') === String(gid);
+      } catch {
+        return false;
+      }
+    };
+
+    const findGroupInAllGroups = (groups, wantGid) => {
+      // allGroups response shape: { groups: [ { group: [ ... ] }, ... ] }
+      const root = Array.isArray(groups) ? groups : [];
+      for (const item of root) {
+        const list = Array.isArray(item?.group) ? item.group : null;
+        if (!list) continue;
+        const index = list.findIndex(g => String(g?.gid ?? '') === String(wantGid));
+        if (index !== -1) return { group: list[index], index };
+      }
+      return null;
+    };
+    const buildNewestPayload = g => {
+      // allGroups payload may omit fields that web-weibo expects when navigating.
+      const apipath = String(g?.apipath ?? '');
+      const api = typeof g?.api === 'string' && g.api ? g.api :
+        apipath === 'statuses/friends/timeline' ? '/ajax/feed/friendstimeline' : null;
+      return {
+        ...g,
+        api: api ?? g?.api,
+        name: g?.name ?? g?.title ?? '最新微博',
+        title: g?.title ?? g?.name ?? '最新微博',
+        loadEmptyPic: g?.loadEmptyPic ?? false,
+        yawf_Trigger: true,
+      };
+    };
+
+    let newestGroupPromise = null;
+    const getNewestGroup = async () => {
+      if (newestGroupPromise) return newestGroupPromise;
+      newestGroupPromise = fetch('/ajax/feed/allGroups', { credentials: 'include' })
+        .then(r => r.json())
+        .then(({ groups } = {}) => findGroupInAllGroups(groups, gid))
+        .catch(() => {
+          newestGroupPromise = null;
+          return null;
+        });
+      return newestGroupPromise;
+    };
+    const routeToNewest = async ({ force = false } = {}) => {
+      if (!force && isAtTarget()) return;
+      router.replace(targetPath).catch(() => {});
+      const bus = app.config.globalProperties.$Bus;
+      if (bus && typeof bus.$emit === 'function') {
+        const groupInfo = await getNewestGroup();
+        if (groupInfo?.group) {
+          bus.$emit('handleHomeNav', buildNewestPayload(groupInfo.group), groupInfo.index, 'left');
+          return;
+        }
+        // fallback: 拿不到完整 group 配置时，尽力触发一次导航（不保证所有站内逻辑都能跟上）
+        bus.$emit('handleHomeNav', { gid, title: '最新微博', yawf_Trigger: true }, 1, 'left');
+        return;
+      }
+    };
+    // Only redirect the initial browser load of Weibo's actual homepage.  Once
+    // the app is open, every link is left to Web Weibo's native navigation.
+    if (isEnabled() && startedAtHome) routeToNewest().catch(() => {});
+
+    // Do not install a router guard, a click guard, or a global navigation-bus
+    // listener: the site reuses their homepage signals for post-detail pages.
+  });
+  //#endregion
 
   appReady.then(app => {
     log('Vue 加载完成');
@@ -1399,6 +1529,12 @@ const CONFIG_TEMPLATE = /* html */`
         <div><yawf-users key="filter::authors" /></div>
       </yawf-rule>
       <p>此处的作者会被应用于微博的作者、转发原作者、共著作者等用户。</p>
+    </yawf-group>
+    <yawf-group name="首页">
+      <yawf-rule id="home::newest">
+        <yawf-checkbox key="home::newest">使用最新微博代替首页（首页微博时间顺序排列）</yawf-checkbox>
+      </yawf-rule>
+      <p>启用后，首次直接打开微博首页时自动进入最新微博；页面内链接保持微博原有跳转行为。</p>
     </yawf-group>
   </yawf-tab>
   <yawf-tab name="界面清理">
