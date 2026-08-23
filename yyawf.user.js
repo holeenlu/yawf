@@ -76,6 +76,13 @@ const payload = (Array(35).fill('\n').join('') + 'void(' + function (config, mes
     }
     $style.textContent += css + '\n';
   };
+  const setStyle = css => {
+    if (!$style) {
+      $style = document.body.appendChild(document.createElement('style'));
+      $style.id = 'yawf_page_style';
+    }
+    $style.textContent = css + '\n';
+  };
   const invokeContentScript = function (method, data) {
     const event = new CustomEvent(messageKey + 'CONTENT', { detail: { method, data } });
     document.dispatchEvent(event);
@@ -99,11 +106,6 @@ const payload = (Array(35).fill('\n').join('') + 'void(' + function (config, mes
   };
   handle('dialog', async ({ id, config }) => {
     invokeContentScript('dialogDone', { id, response: await dialog(config) });
-  });
-  handle('configChange', ({ profileId, key, value }) => {
-    if (profileId !== $CONFIG.user?.idstr) return;
-    yawfConfig[key] = value;
-    if (key === 'cleanup::visitedSuperTopic') updateVisitedSuperTopicStyle(getConfigBoolean(key));
   });
   //#endregion
 
@@ -223,6 +225,13 @@ const payload = (Array(35).fill('\n').join('') + 'void(' + function (config, mes
   const getConfigBoolean = key => yawfConfig[key] === true ||
     (yawfConfig[key] === undefined && configDefaults[key] === true);
   const getConfigStrings = key => Array.isArray(yawfConfig[key]) ? yawfConfig[key].filter(x => typeof x === 'string') : [];
+  const configChangeListeners = new Map();
+  const addConfigChangeListener = (key, listener) => {
+    const listeners = configChangeListeners.get(key) ?? new Set();
+    listeners.add(listener);
+    configChangeListeners.set(key, listeners);
+    return () => listeners.delete(listener);
+  };
   //#endregion
 
   //#region 初始化
@@ -791,12 +800,18 @@ const payload = (Array(35).fill('\n').join('') + 'void(' + function (config, mes
 
   //#region 热搜固顶
   addLifecycleListener('created', 'card-hot-search', instance => {
-    if (!getConfigBoolean('cleanup::searchTop')) return;
+    let enabled = getConfigBoolean('cleanup::searchTop');
+    const clearTopWords = () => {
+      if (!enabled || !instance.data.TopWords?.length) return;
+      log('清理：热搜：置顶热搜', instance.data.TopWords);
+      instance.data.TopWords.splice(0);
+    };
     instance.proxy.$watch(() => instance.data.TopWords, function (TopWords) {
-      if (TopWords?.length) {
-        log('清理：热搜：置顶热搜', TopWords);
-        TopWords.splice(0);
-      }
+      clearTopWords();
+    });
+    addConfigChangeListener('cleanup::searchTop', value => {
+      enabled = value === true;
+      clearTopWords();
     });
   }, { deep: true });
   //#endregion
@@ -845,22 +860,24 @@ const payload = (Array(35).fill('\n').join('') + 'void(' + function (config, mes
       /* css */`[__yawf_component_tips-ad__] { display: none; }`,
     ].join('\n'),
   };
-  let visitedSuperTopicStyle = null;
-  const updateVisitedSuperTopicStyle = enabled => {
-    if (enabled && !visitedSuperTopicStyle) {
-      visitedSuperTopicStyle = document.body.appendChild(document.createElement('style'));
-      visitedSuperTopicStyle.id = 'yawf_visited_super_topic_style';
-      visitedSuperTopicStyle.textContent = cleanupStyles['cleanup::visitedSuperTopic'];
-    } else if (!enabled && visitedSuperTopicStyle) {
-      visitedSuperTopicStyle.remove();
-      visitedSuperTopicStyle = null;
-    }
+  const updateCleanupStyles = () => {
+    const css = Object.keys(cleanupStyles)
+      .filter(key => getConfigBoolean(key))
+      .map(key => cleanupStyles[key])
+      .join('\n');
+    setStyle(css);
   };
   appReady.then(() => {
-    Object.keys(cleanupStyles).forEach(key => {
-      if (key === 'cleanup::visitedSuperTopic') updateVisitedSuperTopicStyle(getConfigBoolean(key));
-      else if (getConfigBoolean(key)) addStyle(cleanupStyles[key]);
+    updateCleanupStyles();
+  });
+  handle('configChange', ({ profileId, key, value }) => {
+    if (profileId !== $CONFIG.user?.idstr) return;
+    yawfConfig[key] = value;
+    configChangeListeners.get(key)?.forEach(listener => {
+      try { listener(value); } catch (error) { console.error(error); }
     });
+    if (key === 'about::debug') isDebug = getConfigBoolean(key);
+    if (Object.prototype.hasOwnProperty.call(cleanupStyles, key)) updateCleanupStyles();
   });
   //#endregion
 
@@ -1177,7 +1194,7 @@ const renderConfig = (container, profileId, template) => {
   let config = readConfig();
   const getConfig = key => config[profileId]?.[key];
   const setConfig = (key, newValue) => {
-    if (JSON.stringify(config[key]) === JSON.stringify(newValue)) return;
+    if (JSON.stringify(config[profileId]?.[key]) === JSON.stringify(newValue)) return;
     writeConfig({
       ...config, [profileId]: {
         ...(config[profileId] ?? {}),
@@ -1195,6 +1212,9 @@ const renderConfig = (container, profileId, template) => {
       if (JSON.stringify(ov) !== JSON.stringify(nv)) {
         configs.get(key)?.forEach(c => c.onChange(nv));
         invokePageScript('configChange', { profileId, key, value: n?.[key] });
+        if (key === 'filter::keywords' || key === 'filter::authors' || key === 'cleanup::searchTop') {
+          setTimeout(() => location.reload(), 0);
+        }
       }
     });
   });
