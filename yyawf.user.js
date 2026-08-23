@@ -100,6 +100,11 @@ const payload = (Array(35).fill('\n').join('') + 'void(' + function (config, mes
   handle('dialog', async ({ id, config }) => {
     invokeContentScript('dialogDone', { id, response: await dialog(config) });
   });
+  handle('configChange', ({ profileId, key, value }) => {
+    if (profileId !== $CONFIG.user?.idstr) return;
+    yawfConfig[key] = value;
+    if (key === 'cleanup::visitedSuperTopic') updateVisitedSuperTopicStyle(getConfigBoolean(key));
+  });
   //#endregion
 
   //#region 网络请求
@@ -212,7 +217,11 @@ const payload = (Array(35).fill('\n').join('') + 'void(' + function (config, mes
   //#endregion
 
   //#region 配置
-  const getConfigBoolean = key => yawfConfig[key] === true;
+  const configDefaults = {
+    'cleanup::visitedSuperTopic': true,
+  };
+  const getConfigBoolean = key => yawfConfig[key] === true ||
+    (yawfConfig[key] === undefined && configDefaults[key] === true);
   const getConfigStrings = key => Array.isArray(yawfConfig[key]) ? yawfConfig[key].filter(x => typeof x === 'string') : [];
   //#endregion
 
@@ -808,6 +817,7 @@ const payload = (Array(35).fill('\n').join('') + 'void(' + function (config, mes
     'cleanup::navDarkMode': /* css */`[__yawf_component_weibo-top-nav-base__] [__yawf_component_dark__] { display: none; }`,
     'cleanup::navAria': /* css */`[__yawf_component_aria__] { display: none; }`,
     'cleanup::hotSearch': /* css */`[__yawf_component_card-hot-search__] { display: none; }`,
+    'cleanup::visitedSuperTopic': /* css */`[__yawf_component_card-visited-super-topic__] { display: none; }`,
     'cleanup::interested': /* css */`[__yawf_component_card-interested__] { display: none; }`,
     'cleanup::creatorCenter': /* css */`[__yawf_component_card-service__] { display: none; }`,
     'cleanup::sideFooter': /* css */`.wbpro-side-copy[__yawf_component_index__] { display: none; }`,
@@ -835,9 +845,21 @@ const payload = (Array(35).fill('\n').join('') + 'void(' + function (config, mes
       /* css */`[__yawf_component_tips-ad__] { display: none; }`,
     ].join('\n'),
   };
+  let visitedSuperTopicStyle = null;
+  const updateVisitedSuperTopicStyle = enabled => {
+    if (enabled && !visitedSuperTopicStyle) {
+      visitedSuperTopicStyle = document.body.appendChild(document.createElement('style'));
+      visitedSuperTopicStyle.id = 'yawf_visited_super_topic_style';
+      visitedSuperTopicStyle.textContent = cleanupStyles['cleanup::visitedSuperTopic'];
+    } else if (!enabled && visitedSuperTopicStyle) {
+      visitedSuperTopicStyle.remove();
+      visitedSuperTopicStyle = null;
+    }
+  };
   appReady.then(() => {
     Object.keys(cleanupStyles).forEach(key => {
-      if (getConfigBoolean(key)) addStyle(cleanupStyles[key]);
+      if (key === 'cleanup::visitedSuperTopic') updateVisitedSuperTopicStyle(getConfigBoolean(key));
+      else if (getConfigBoolean(key)) addStyle(cleanupStyles[key]);
     });
   });
   //#endregion
@@ -1169,9 +1191,10 @@ const renderConfig = (container, profileId, template) => {
     const o = oldConfig[profileId], n = newConfig[profileId];
     const keys = new Set(Object.keys(o ?? {}).concat(Object.keys(n ?? {})));
     keys.forEach(key => {
-      const ov = o?.[key] ?? null, nv = n?.[key] ?? null;
+      const ov = o?.[key], nv = n?.[key];
       if (JSON.stringify(ov) !== JSON.stringify(nv)) {
         configs.get(key)?.forEach(c => c.onChange(nv));
+        invokePageScript('configChange', { profileId, key, value: n?.[key] });
       }
     });
   });
@@ -1196,7 +1219,7 @@ const renderConfig = (container, profileId, template) => {
     onChange(value) { this.renderValue(value); }
   }
   class CheckboxConfigItem extends ConfigItem {
-    renderValue(value) { this.dom.checked = value; }
+    renderValue(value) { this.dom.checked = value === undefined ? this.defaultValue : value; }
   }
   class SelectConfigItem extends ConfigItem {
     renderValue(value) { this.dom.value = value; }
@@ -1557,6 +1580,7 @@ const CONFIG_TEMPLATE = /* html */`
       <yawf-rule id="cleanup::sideFooter"><yawf-checkbox key="cleanup::sideFooter">底部链接</yawf-checkbox></yawf-rule>
       <yawf-rule id="cleanup::service"><yawf-checkbox key="cleanup::service">常用功能</yawf-checkbox></yawf-rule>
       <yawf-rule id="cleanup::followRecom"><yawf-checkbox key="cleanup::followRecom">关注推荐</yawf-checkbox></yawf-rule>
+      <yawf-rule id="cleanup::visitedSuperTopic"><yawf-checkbox key="cleanup::visitedSuperTopic" default="true">经常访问的超话</yawf-checkbox></yawf-rule>
     </yawf-group>
     <yawf-group name="微博内容" class="yawf-compact-group">
       <yawf-rule id="cleanup::feedEmptyTip"><yawf-checkbox key="cleanup::feedEmptyTip">已刷完提示</yawf-checkbox></yawf-rule>
