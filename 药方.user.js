@@ -2,7 +2,7 @@
 // @name              药方
 // @description       微博主页与搜索页广告、热搜及界面清理，关键字过滤，使用微博原生黑名单屏蔽微博和评论。
 // @namespace         https://github.com/tiansh
-// @version           1.8.4
+// @version           1.8.5
 // @match             https://weibo.com/*
 // @match             https://www.weibo.com/*
 // @match             https://s.weibo.com/*
@@ -56,6 +56,8 @@
   const DEFAULT_CONFIG = Object.freeze({
     'feed::latest': false,
     'cleanup::visitedSuperTopic': true,
+    'cleanup::customGroups': true,
+    'cleanup::feedBanner': true,
   });
 
   const FILTER_KEYS = Object.freeze([
@@ -82,6 +84,8 @@
     'cleanup::service',
     'cleanup::followRecom',
     'cleanup::visitedSuperTopic',
+    'cleanup::customGroups',
+    'cleanup::feedBanner',
     'cleanup::feedEmptyTip',
     'cleanup::feedSource',
     'cleanup::feedFollow',
@@ -141,6 +145,11 @@
       ],
     },
     {
+      name: '左栏',
+      description: '隐藏自定义分组标题、管理按钮及分组入口，保留全部关注、最新微博等默认入口。',
+      items: [['cleanup::customGroups', '自定义分组']],
+    },
+    {
       name: '侧栏',
       items: [
         ['cleanup::hotSearch', '热搜'],
@@ -156,6 +165,7 @@
     {
       name: '微博内容',
       items: [
+        ['cleanup::feedBanner', '信息流顶部横幅'],
         ['cleanup::feedEmptyTip', '已刷完提示'],
         ['cleanup::feedSource', '来源'],
         ['cleanup::feedFollow', '关注按钮'],
@@ -202,6 +212,8 @@
     'cleanup::service': ['service'],
     'cleanup::followRecom': ['follow-recommendation'],
     'cleanup::visitedSuperTopic': ['visited-super-topic'],
+    'cleanup::customGroups': ['custom-groups'],
+    'cleanup::feedBanner': ['feed-banner'],
     'cleanup::feedEmptyTip': ['feed-empty-tip'],
     'cleanup::feedSource': ['feed-source'],
     'cleanup::feedFollow': ['feed-follow'],
@@ -226,7 +238,7 @@
     sidebar: [
       'cleanup::hotSearch', PROMOTED_HOT_SEARCH_KEY, 'cleanup::interested',
       'cleanup::creatorCenter', 'cleanup::sideFooter', 'cleanup::service',
-      'cleanup::followRecom', 'cleanup::visitedSuperTopic',
+      'cleanup::followRecom', 'cleanup::visitedSuperTopic', 'cleanup::customGroups',
     ],
     feeds: [
       'cleanup::feedEmptyTip', 'cleanup::feedSource', 'cleanup::feedFollow',
@@ -410,11 +422,13 @@
       favoriteTags: config['cleanup::favoriteTags'] === true,
       favoriteStatic: config['cleanup::favoriteStatic'] === true,
       wideFeed: config['layout::wideFeed'] === true,
+      feedBanner: config['cleanup::feedBanner'] === true,
       ads: config['cleanup::ad'] === true,
     };
     plan.hasDomWork = (
       plan.navigation || plan.sidebar || plan.feeds || plan.comments ||
-      plan.icons || plan.profile || plan.ads || plan.favoriteTags || plan.favoriteStatic || plan.wideFeed
+      plan.icons || plan.profile || plan.ads || plan.favoriteTags || plan.favoriteStatic || plan.wideFeed ||
+      plan.feedBanner
     );
     return plan;
   };
@@ -466,6 +480,8 @@
   ].join(', ');
   const AD_LABELS = new Set(['广告', '微博广告', '推广', '荐读']);
   const HOT_PROMOTION_LABELS = new Set(['推荐', '推广', '广告']);
+  const FEED_BANNER_CONTAINER_SELECTOR = '#homeWrap > div > div:has(> .woo-picture-main)';
+  const FEED_BANNER_IMAGE_SELECTOR = '#homeWrap > div > div > .woo-picture-main > img';
 
   const STATIC_RULE_SELECTORS = Object.freeze({
     'cleanup::navHome': [
@@ -1199,7 +1215,62 @@
     }
   };
 
+  const markCustomGroups = (root = document) => {
+    const builtinTitles = new Set(['全部关注', '最新微博', '特别关注', '好友圈']);
+    const isBuiltinLink = link => builtinTitles.has(
+      link.querySelector('[role="link"][title]')?.getAttribute('title') ?? elementText(link)
+    );
+    for (const heading of queryAll(root, 'h3')) {
+      if (elementText(heading) !== '自定义分组') continue;
+      const header = heading.parentElement;
+      const list = header?.parentElement;
+      if (!list?.closest('.woo-panel-main') || list.closest('main, article, [role="dialog"]')) continue;
+      // The real sidebar shares one list between built-in and custom groups.
+      // Mark the custom section's individual siblings, never the shared list.
+      if (![...list.children].some(child => child.matches('a[href]') && isBuiltinLink(child))) continue;
+      markRole(header, 'custom-groups');
+      const divider = header.previousElementSibling;
+      if (divider?.matches('.woo-divider-main, [role="separator"]')) markRole(divider, 'custom-groups');
+      for (let sibling = header.nextElementSibling; sibling; sibling = sibling.nextElementSibling) {
+        if (sibling.matches('h1, h2, h3, .woo-divider-main, [role="separator"]') ||
+          sibling.querySelector('h1, h2, h3')) break;
+        const links = queryAll(sibling, 'a[href]');
+        if (links.some(isBuiltinLink)) break;
+        if (!links.length) continue;
+        const onlyGroups = links.every(link => {
+          try {
+            const url = new URL(link.getAttribute('href'), location.href);
+            return url.origin === location.origin && url.pathname === '/mygroups' &&
+              /^\d+$/.test(url.searchParams.get('gid') ?? '');
+          } catch {
+            return false;
+          }
+        });
+        if (onlyGroups) markRole(sibling, 'custom-groups');
+      }
+    }
+  };
+
+  const markFeedBanner = (root = document) => {
+    for (const image of queryAll(root, FEED_BANNER_IMAGE_SELECTOR)) {
+      if (image.closest('article')) continue;
+      const commercialImage = ['src', 'data-src'].some(attribute => {
+        try {
+          return new URL(image.getAttribute(attribute) ?? '', location.href).hostname === 'kadmimage.biz.weibo.com';
+        } catch {
+          return false;
+        }
+      });
+      if (!commercialImage) continue;
+      const container = image.parentElement.parentElement;
+      if (!container.matches(FEED_BANNER_CONTAINER_SELECTOR) ||
+        container.querySelector('article, textarea, [contenteditable="true"]')) continue;
+      markRole(container, 'feed-banner');
+    }
+  };
+
   const markSidebar = (root = document) => {
+    if (activeConfig['cleanup::customGroups'] === true) markCustomGroups(root);
     const hotRoots = queryAll(root, '.hotBand');
     if (activeConfig['cleanup::hotSearch'] === true) {
       hotRoots.forEach(element => markRole(nearestCard(element), 'hot-search'));
@@ -1967,6 +2038,7 @@
     'nav', '[role="navigation"]', '[role="menu"]',
     '.woo-pop-main', '.woo-pop-wrap-main', '.hotBand', '.wbpro-side', '.rightSide', 'aside',
     '.wbpro-pos', '.woo-panel-main',
+    FEED_BANNER_CONTAINER_SELECTOR,
     '.card-wrap[action-type="feed_list_item"]', '.card-review[comment_id]',
     '.card-user-b', '.card-user-c', '#pl_pic_feedlist .pic[node-type="box"]', '.hot-band-container',
   ].join(', ');
@@ -2236,6 +2308,7 @@
     const steps = [
       [activePlan.navigation && !contentOnly, markNavigation],
       [activePlan.sidebar && !contentOnly, markSidebar],
+      [activePlan.feedBanner && !contentOnly, markFeedBanner],
       [activePlan.feeds, markFeeds],
       [activePlan.comments, markComments],
       [IS_SEARCH_PAGE && activePlan.hasDomWork, markSearchPage],
@@ -2796,7 +2869,7 @@
               <section class="panel" data-panel="about" hidden>
                 <h2>关于</h2>
                 <div class="notice">
-                  yyawf 1.8.4 合并药方 1.8.3 与本地 yyawf 0.0.15 改进，源码依照 MPL-2.0 发布。
+                  药方 1.8.5 合并药方 1.8.3 与本地 yyawf 0.0.15 改进，源码依照 MPL-2.0 发布。
                 </div>
                 <p><a href="https://github.com/tiansh/yawf/tree/yyawf" target="_blank" rel="noopener noreferrer">上游源码与原作者信息</a></p>
                 <h3>调试</h3>
@@ -2978,6 +3051,8 @@
           ? record.target
           : record.target.parentElement;
         if (!target || target.closest?.(`[${OWNED_ATTR}]`)) continue;
+        if (record.type === 'attributes' && ['src', 'data-src'].includes(record.attributeName) &&
+          !target.matches(FEED_BANNER_IMAGE_SELECTOR)) continue;
         if (
           record.type === 'attributes' &&
           (target === document.documentElement || target === document.body || target.matches('main'))
@@ -3039,7 +3114,7 @@
       attributeFilter: [
         'class', 'role', 'href', 'title', 'aria-label', 'alt', 'usercard',
         'data-ad', 'data-adid', 'data-ad-id', 'title_source',
-        'action-type', 'node-type', 'uid', 'mid', 'comment_id',
+        'action-type', 'node-type', 'uid', 'mid', 'comment_id', 'src', 'data-src',
       ],
     });
 

@@ -62,6 +62,8 @@ test('invalid stores and wrong input types do not become valid settings', () => 
 test('retains repository defaults and explicit disabled switches', () => {
   assert.equal(api.resolveConfig({})['feed::latest'], false);
   assert.equal(api.resolveConfig({})['cleanup::visitedSuperTopic'], true);
+  assert.equal(api.resolveConfig({})['cleanup::customGroups'], true);
+  assert.equal(api.resolveConfig({})['cleanup::feedBanner'], true);
   assert.equal(api.resolveConfig({ 'cleanup::visitedSuperTopic': false })['cleanup::visitedSuperTopic'], false);
 });
 
@@ -93,12 +95,24 @@ test('visiting a local blocked author profile exempts only that author', () => {
 });
 
 test('disabled cleanup has no work and visited-super-topic cleanup can be restored', () => {
-  const off = { 'cleanup::visitedSuperTopic': false };
+  const off = {
+    'cleanup::visitedSuperTopic': false, 'cleanup::customGroups': false, 'cleanup::feedBanner': false,
+  };
   assert.equal(api.compileWorkPlan(off).hasDomWork, false);
   const on = api.resolveConfig({});
   assert.equal(api.compileWorkPlan(on).sidebar, true);
   assert.match(api.buildCleanupCss(on), /visited-super-topic/);
   assert.doesNotMatch(api.buildCleanupCss(off), /visited-super-topic/);
+});
+
+test('top banner cleanup runs independently of feed content classifiers', () => {
+  const plan = api.compileWorkPlan({ 'cleanup::visitedSuperTopic': false, 'cleanup::customGroups': false });
+  assert.equal(plan.feedBanner, true);
+  assert.equal(plan.hasDomWork, true);
+  assert.equal(plan.feeds, false);
+  assert.equal(plan.sidebar, false);
+  assert.match(api.buildCleanupCss(plan.config), /feed-banner/);
+  assert.doesNotMatch(api.buildCleanupCss({ 'cleanup::feedBanner': false }), /feed-banner/);
 });
 
 test('only exact homepage URLs qualify for initial latest-feed redirect', () => {

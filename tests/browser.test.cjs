@@ -31,7 +31,7 @@ async function fixture(t, options = {}) {
   });
   const html = '<!doctype html><html><head><meta charset="utf-8"></head><body>' +
     (options.noProfile ? '' : '<nav><a id="profile" href="/u/111">profile</a><a id="home" href="/">首页</a></nav>') +
-    '<main>' + (options.html ?? article('feed', '222', 'hello')) + '</main></body></html>';
+    (options.sidebar ?? '') + '<main>' + (options.html ?? article('feed', '222', 'hello')) + '</main></body></html>';
   // Every document is a local fixture; no requests reach Weibo or a live account.
   await page.route('**/*', route => route.request().resourceType() === 'document'
     ? route.fulfill({ status: 200, contentType: 'text/html', body: html }) : route.abort());
@@ -312,4 +312,94 @@ test('batch keyword import appends, deduplicates and refreshes remote additions'
   await page.locator('.keyword-batch').fill('later');
   await page.locator('.keyword-import').click();
   assert.equal(await page.locator('.keyword-list li').count(), 4);
+});
+
+// Structure captured from the live page: built-ins and custom links share one list.
+const customSidebar = '<aside><div class="woo-panel-main"><div id="group-list">' +
+  '<a id="all-following" href="/"><div role="link" title="全部关注">全部关注</div></a>' +
+  '<a id="latest" href="/mygroups?gid=11000111"><div role="link" title="最新微博">最新微博</div></a>' +
+  '<a id="special" href="/mygroups?gid=3568799875773881"><div role="link" title="特别关注">特别关注</div></a>' +
+  '<a id="friends" href="/mygroups?gid=10009111"><div role="link" title="好友圈">好友圈</div></a>' +
+  '<div id="group-divider" class="woo-divider-main"></div>' +
+  '<div id="group-heading" class="woo-box-flex"><h3>自定义分组</h3><button>管理</button></div>' +
+  '<a id="quiet-following" href="/mygroups?gid=10005111">悄悄关注</a>' +
+  '</div></div></aside>';
+
+const bannerLayout = '<div id="homeWrap"><section id="publisher"><textarea aria-label="发微博"></textarea></section><div>' +
+  '<div id="top-banner" class="woo-box-flex"><div class="woo-picture-main">' +
+  '<img id="banner-image" src="https://kadmimage.biz.weibo.com/example/banner.jpeg"></div></div>' +
+  '<div id="ordinary-picture" class="woo-box-flex"><div class="woo-picture-main">' +
+  '<img src="https://h5.sinaimg.cn/example/ordinary.jpeg"></div></div>' +
+  '<div class="scroller">' + article('safe-feed', '222',
+    '<img src="https://kadmimage.biz.weibo.com/example/shared.jpeg">正文提到自定义分组') +
+  '</div></div></div>';
+
+const hidden = (page, id) => page.waitForFunction(id =>
+  getComputedStyle(document.getElementById(id)).display === 'none', id);
+const visible = (page, id) => page.waitForFunction(id => {
+  const node = document.getElementById(id);
+  return node && getComputedStyle(node).display !== 'none' && node.getClientRects().length > 0;
+}, id);
+
+test('custom groups hide by default while preserving built-in navigation and feed content', async t => {
+  const page = await fixture(t, { sidebar: customSidebar,
+    html: article('feed', '222', '<h3>自定义分组</h3>普通正文'),
+  });
+  for (const id of ['group-divider', 'group-heading', 'quiet-following']) await hidden(page, id);
+  for (const id of ['all-following', 'latest', 'special', 'friends', 'feed']) await visible(page, id);
+  await page.evaluate(() => window.__openSettings());
+  await page.locator('button[data-tab="cleanup"]').click();
+  const toggle = page.locator('input[data-key="cleanup::customGroups"]');
+  assert.equal(await toggle.count(), 1);
+  await toggle.uncheck();
+  for (const id of ['group-heading', 'quiet-following']) await visible(page, id);
+  assert.equal(await page.evaluate(() => window.__store.CONFIG[111]['cleanup::customGroups']), false);
+});
+
+test('custom groups inserted dynamically are hidden and stop at the next sidebar section', async t => {
+  const page = await fixture(t, { sidebar: customSidebar });
+  await page.locator('#group-list').evaluate(node => node.insertAdjacentHTML('beforeend',
+    '<a id="new-group" href="/mygroups?gid=123456">新分组</a>' +
+    '<div id="next-heading"><h3>其他功能</h3></div><a id="other-group" href="/mygroups?gid=789">其他入口</a>'));
+  await hidden(page, 'new-group');
+  await visible(page, 'next-heading');
+  await visible(page, 'other-group');
+});
+
+test('the top commercial banner hides without removing the publisher, normal pictures or posts', async t => {
+  const page = await fixture(t, { html: bannerLayout });
+  await hidden(page, 'top-banner');
+  for (const id of ['publisher', 'ordinary-picture', 'safe-feed']) await visible(page, id);
+  await page.evaluate(() => window.__openSettings());
+  await page.locator('button[data-tab="cleanup"]').click();
+  const toggle = page.locator('input[data-key="cleanup::feedBanner"]');
+  assert.equal(await toggle.count(), 1);
+  await toggle.uncheck();
+  await visible(page, 'top-banner');
+  await toggle.check();
+  await hidden(page, 'top-banner');
+});
+
+test('banner image replacement and lazy loading update only the banner classification', async t => {
+  const page = await fixture(t, { html: bannerLayout });
+  await hidden(page, 'top-banner');
+  await page.locator('#banner-image').evaluate(image => {
+    image.src = 'https://h5.sinaimg.cn/example/ordinary.jpeg';
+  });
+  await visible(page, 'top-banner');
+  await page.locator('#banner-image').evaluate(image => {
+    image.setAttribute('data-src', 'https://kadmimage.biz.weibo.com/example/lazy.jpeg');
+  });
+  await hidden(page, 'top-banner');
+  await page.locator('#banner-image').evaluate(image => image.removeAttribute('data-src'));
+  await visible(page, 'top-banner');
+});
+
+test('new cleanup switches respect explicit disabled settings', async t => {
+  const page = await fixture(t, {
+    sidebar: customSidebar, html: bannerLayout,
+    config: { 'cleanup::customGroups': false, 'cleanup::feedBanner': false },
+  });
+  await page.waitForFunction(() => window.__store['BLACKLIST:111']);
+  for (const id of ['group-heading', 'quiet-following', 'top-banner']) await visible(page, id);
 });
